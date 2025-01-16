@@ -1,3 +1,5 @@
+// TODO: Replace with full Thermal npm package once I get this finished.
+
 type TimeUnit =
     "SECONDS" |
     "MINUTES" |
@@ -5,9 +7,11 @@ type TimeUnit =
     "DAYS"
 ;
 type TimeDelay = { amount: number, unit: TimeUnit };
+type OnExpired = <T>(value: T, key: string)=>void;
 type CachedValue = {
-    value: any;
     expiration: number;
+    value: any;
+    onExpire?: OnExpired;
 }
 
 class TimedCache {
@@ -23,23 +27,29 @@ class TimedCache {
                 if (value.expiration > currentDate) return;
 
                 this._cache.delete(key);
+                value.onExpire?.(value.value, key);
             });
         }, 20 * 1000) as any);
     }
 
-    public cache = (config: Config<any>, response: any) => {
+    public cache = (config: Config<any>, value: any) => {
         if(config.cacheResponse() == null) return;
         const msDelay = TimedCache.millisecondsFromTimeDelay(config.cacheResponse() as TimeDelay);
         const expiration = Date.now() + msDelay;
         const key = TimedCache.generateCacheKey(config);
-        this._cache.set(key, { expiration, value: response });
+        const onExpire = config.cacheResponse()?.onExpire;
+        this._cache.set(key, { expiration, value, onExpire });
 
         // Schedule automatic deletion after TTL
         setTimeout(() => {
             if (!this._cache.has(key)) return;
             if ((this._cache.get(key)?.expiration ?? 0) > Date.now()) return;
 
+            const cachedValue = this._cache.get(key);
             this._cache.delete(key);
+            try {
+                cachedValue?.onExpire?.(cachedValue.value, key);
+            } catch {}
         }, msDelay);
     }
 
@@ -47,14 +57,19 @@ class TimedCache {
         const key = TimedCache.generateCacheKey(config);
 
         const cacheItem = this._cache.get(key);
-        if (!cacheItem) return null;
+        if (cacheItem == undefined) return null;
 
         if (cacheItem.expiration <= Date.now()) {
             this._cache.delete(key);
+            cacheItem.onExpire?.(cacheItem.value, key);
             return null;
         }
-
+        
         return cacheItem.value;
+    }
+
+    public clear = () => {
+        this._cache.clear();
     }
 
     public close = () => {
@@ -65,12 +80,11 @@ class TimedCache {
     private static generateCacheKey = (config: Config<any>) => {
         // Create a sorted options object to ensure consistent cache keys
         const options = [
-            config.url(),
-            config.method(),
-            config.body(),
-            config.header()
+            JSON.stringify(config.url()),
+            JSON.stringify(config.method()),
+            JSON.stringify(config.body()),
+            JSON.stringify(config.header())
         ].join("-----");
-
         /*
         const hash = Crypto.createHash('sha1');
         hash.update(options);
@@ -92,14 +106,14 @@ class TimedCache {
     }
 }
 
-type ThermalError = {
+export type ThermalError = {
     code: number;
     type: ErrorType;
     message: string;
 }
-type ThermalResponse<T> = {
+export type ThermalResponse<T> = {
     data?: T;
-    error?: Error;
+    error?: ThermalError;
     status: "success" | "error";
 }
 type Method = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
@@ -290,7 +304,7 @@ const resolveError = (type: ErrorType, message?: string): ThermalError => {
     }
 }
 
-const validateResponse = (response: any): response is Response => {
+const validateResponse = (response: any): boolean => {
     if (typeof response !== "object" || response === null) return false;
 
     if (response.status === "success")
@@ -322,116 +336,177 @@ const handleErrorCallbacks = (
     const handler = config.onError().get(type);
     if(handler == null && config.onAnyError() == null) {
         try {
-            config.onAnyOtherErrors()(error);
+            config.onAnyOtherErrors()(error, config);
         } catch {}
         return;
     }
 
     try {
-        handler?.(error);
+        handler?.(error, config);
     } catch {}
     try {
-        config.onAnyError()?.(error);
+        config.onAnyError()?.(error, config);
     } catch {}
 }
 
 type PreProcessor = <T>(request: Config<T>)=>void;
-type PostProcessor = (rawResponse: Response)=>void;
+type PostProcessor = <T>(response: any, request: Config<T>)=>void;
+type ErrorHandler = <T>(error: ThermalError, request: Config<T>)=>void;
 
 const Cache = new TimedCache();
 let BaseUrl = "";
 let PreProcessors = new Array<PreProcessor>();
 let PostProcessors = new Array<PostProcessor>();
 let DefaultSuccessHandler: ((response: any)=>void) | null = r=>console.log(r);
-let DefaultErrorHandlers = new Map<ErrorType, (error: ThermalError)=>void>();
-let DefaultAnyErrorHandler: ((error: ThermalError)=>void) | null = null;
-let DefaultAnyOtherErrorHandler: ((e: ThermalError)=>void) = e=>console.warn(e);
+let DefaultErrorHandlers = new Map<ErrorType, ErrorHandler>();
+let DefaultAnyErrorHandler: (ErrorHandler) | null = null;
+let DefaultAnyOtherErrorHandler: (ErrorHandler) = e=>console.warn(e);
+let DisableCache = false;
 
-const thermalFetch = <T>(config: Config<T>): void => {
-    try {
-        PreProcessors.forEach(p => p<T>(config))
-    } catch {}
-
-    const compiledHeaders: [ string, string ][] = [];
-    config.header().forEach(h => compiledHeaders.push([h.key, h.value]));
+const thermalFetch = async <T>(config: Config<T>) => {
+    for (const p of PreProcessors)
+        try {
+            await Promise.resolve(p<T>(config));
+        } catch {}
 
     if(config.eagerResponse() != null) try {
-        config.onSuccess()?.(config.eagerResponse() as T);
+        await Promise.resolve(config.onSuccess()?.(config.eagerResponse() as T));
     } catch {}
-    if(config.cacheResponse() != null) try {
+    if(config.cacheResponse() != null && !DisableCache) try {
         const cachedResponse = Cache.fetch<T>(config);
         if(cachedResponse == null) throw new Error();
 
-        config.onSuccess()?.(cachedResponse);
+        // Add a 10ms delay so this acts as a promise. This re-adds expected behavior pertaining to state setting.
+        setTimeout(async ()=>{
+            await Promise.resolve(config.onSuccess()?.(cachedResponse));
+            config.onFinal()?.();
+        }, 10);
+        return;
     } catch {}
-    /*
-    fetch(`${BaseUrl}${config.url()}`, { body: config.body(), method: config.method(), headers: compiledHeaders })
-        .then((r: Response) => {
-            r.json().then((json: ThermalResponse<T>) => {
-                if(!validateResponse(r)) return
-                if(r.status === 200) {
-                    if(json.status !== "success") return handleErrorCallbacks(config, "BAD_FORMAT_ERROR");
 
+    const compiledHeaders: [ string, string ][] = [];
+    config.header("Content-Type","application/json");
+    config.header().forEach((v, k) => compiledHeaders.push([k, v]));
+    
+    let path = BaseUrl + config.url();
+    if(config.metadata().get("NoBasePath") === true) path = config.url()+"";
+    if(config.query()?.size > 0) path = `${path}?${Array.from(config.query()).map(e=>(`${e[0]}=${e[1]}`)).join("&") ?? ""}`;
+
+console.log(path);
+
+    fetch(path, {
+        body: JSON.stringify(config.body()),
+        method: config.method(),
+        headers: compiledHeaders
+    })
+        .then(async (r: Response) => {
+            try {
+                const v = await r.text();
+
+                for (const p of PostProcessors)
                     try {
-                        PostProcessors.forEach(p => p(r))
+                        await Promise.resolve(p(v, config));
                     } catch {}
-                    const data = config.onSuccess()?.(json?.data ?? ({} as T));
-                    if(config.cacheResponse() != null) Cache.cache(config, data);
+                
+                // No body
+                if (v.length == 0) {
+                    if(r.ok) {
+                        config.onSuccess()?.({} as T);
+                        if(config.cacheResponse() != null && !DisableCache) Cache.cache(config, {});
+                    } else {
+                        const error = Array.from(ThermalErrorType.values()).find(e => e.code === r.status)?.type ?? "UNKNOWN_ERROR";
+                        handleErrorCallbacks(config, error);
+                    }
+                } else {
+                    // Has body
+                    const json: ThermalResponse<T> = JSON.parse(v);
+
+                    if(!validateResponse(json)) return handleErrorCallbacks(config, "BAD_FORMAT_ERROR");
+
+                    if(json.status === "success") {
+                        await Promise.resolve(config.onSuccess()?.(json.data as T));
+                        if(config.cacheResponse() != null && !DisableCache) Cache.cache(config, json.data);
+                    } else {
+                        const error = Array.from(ThermalErrorType.values()).find(e => e.code === json?.error?.code)?.type ?? "UNKNOWN_ERROR";
+                        handleErrorCallbacks(config, error, json.error?.message);
+                    }
                 }
-            }).catch(e => {
+            } catch(e) {
                 try {
-                    PostProcessors.forEach(p => p(r))
-                } catch {}
-                handleErrorCallbacks(config, "UNKNOWN_ERROR", e.message);
-            })
+                    handleErrorCallbacks(config, "UNKNOWN_ERROR", (e as any).message);
+                } catch {
+                    handleErrorCallbacks(config, "UNKNOWN_ERROR");
+                }
+            }
         })
         .catch((e: Error)=>{
-            handleErrorCallbacks(config, "UNKNOWN_ERROR", e.message);
-        })*/
+            let errorCode: ErrorType | undefined = undefined;
+            if (e.name === "TypeError" && e.message === "Failed to fetch") errorCode = "NETWORK_ERROR";
+            else if (e.name === "AbortError") errorCode = "ABORT_ERROR";
+            else if (e.name === "TypeError" && e.message.includes("CORS")) errorCode = "CORS_ISSUE";
+            else if (e.name === "TypeError" && e.message === "NetworkError when attempting to fetch resource.") errorCode = "INVALID_URL_ERROR";
+            else if (e.message.includes("timeout")) errorCode = "TIMEOUT_ERROR";
+            handleErrorCallbacks(config, errorCode ?? "UNKNOWN_ERROR", e.message);
+        })
+        .finally(()=>config.onFinal()?.())
 }
 
-type RequestConfigurator = <T>(config: Config<T>) => void;
+export type RequestConfigurator = <T>(config: Config<T>) => void;
 class Config<R> {
     private _url: string | URL = "";
     private _method: Method = "GET";
-    private _body?: any;
-    private _headers: Set<{ key: string, value: string }> = new Set();
+    private _body?: any = undefined;
+    private _headers = new Map<string, string>();
     private _eagerResponse: R | null = null;
-    private _cacheResponse: TimeDelay | null = null;
+    private _cacheResponse: (TimeDelay & { onExpire?: OnExpired }) | null = null;
     private _onSuccess: ((data: R)=>void) | null = DefaultSuccessHandler;
-    private _onError: Map<ErrorType, (error: ThermalError)=>void> = DefaultErrorHandlers;
-    private _onAnyError: ((error: ThermalError)=>void) | null = DefaultAnyErrorHandler;
-    private _onAnyOtherErrors: (error: ThermalError)=>void = DefaultAnyOtherErrorHandler;
+    private _onError: Map<ErrorType, ErrorHandler> = new Map(DefaultErrorHandlers);
+    private _onAnyError: ErrorHandler | null = DefaultAnyErrorHandler;
+    private _onAnyOtherErrors: ErrorHandler = DefaultAnyOtherErrorHandler;
+    private _onFinal: (()=>void) | null = null;
+    private _metadata = new Map<string, any>();
+    private _queries = new Map<string, string>();
 
     public url (url?: string | URL) {
-        if(url) this._url = url;
+        if(url != undefined) this._url = url;
         return this._url;
     }
     public method (method?: Method) {
-        if(method) this._method = method;
+        if(method != undefined) this._method = method;
         return this._method;
     }
     public body (body?: any) {
-        if(body) this._body = body;
+        if(body != undefined) this._body = body;
         return this._body;
     }
     public header (key?: string, value?: string) {
         if(key == undefined || value == undefined) return this._headers;
-        this._headers.add({key, value});
+        this._headers.set(key, value);
         return this._headers;
+    }
+    public metadata (key?: string, value?: any) {
+        if(key == undefined || value == undefined) return this._metadata;
+        this._metadata.set(key, value);
+        return this._metadata;
     }
     public eagerResponse (value?: R | null) {
         if(value != undefined) this._eagerResponse = value;
         return this._eagerResponse;
     }
-    public cacheResponse (amount?: number, unit?: TimeUnit) {
+    public query (key?: string, value?: string | number | boolean) {
+        if(key == undefined || value == undefined) return this._queries;
+
+        this._queries.set(key, `${value}`);
+        return this._queries;
+    }
+    public cacheResponse (amount?: number, unit?: TimeUnit, onExpire?: OnExpired) {
         if(amount == undefined || unit == undefined) return this._cacheResponse;
 
-        this._cacheResponse = { amount, unit } as TimeDelay;
+        this._cacheResponse = { amount, unit, onExpire };
         return this._cacheResponse;
     }
     public onSuccess (handler?: (data: R)=>void | null) {
-        if(handler) this._onSuccess = handler;
+        if(handler != undefined) this._onSuccess = handler;
         return this._onSuccess;
     }
     public onError (target?: ErrorType, handler?: (error: ThermalError)=>void) {
@@ -440,12 +515,16 @@ class Config<R> {
         return this._onError;
     }
     public onAnyError (handler?: (error: ThermalError)=>void | null) {
-        if(handler) this._onAnyError = handler;
+        if(handler != undefined) this._onAnyError = handler;
         return this._onAnyError;
     }
     public onAnyOtherErrors (handler?: (error: ThermalError)=>void) {
-        if(handler) this._onAnyOtherErrors = handler;
+        if(handler != undefined) this._onAnyOtherErrors = handler;
         return this._onAnyOtherErrors;
+    }
+    public onFinal (handler?: ()=>void | null) {
+        if(handler != undefined) this._onFinal = handler;
+        return this._onFinal;
     }
 
 
@@ -523,6 +602,18 @@ export const withHeader = (header: string, value: string): RequestConfigurator =
 );
 
 /**
+ * Provides a metadata to use for this request.
+ * You can use this method multiple times to provide multiple metadata mappings.
+ * Metadata does not effect the actual HTTP request at all.
+ * It simply exists for the caller to read later if they so desire.
+ * @param key The key to assign a value to.
+ * @param value The value to provide for the metadata.
+ */
+export const withMetadata = (key: string, value: any): RequestConfigurator => (
+    (config: Config<any>) => config.metadata(key, value)
+);
+
+/**
  * Provides an Authorization bearer token to use for this request.
  * This method assigns `Bearer ${value}` to the header `Authorization`.
  * @param value The value to attach as the bearer token.
@@ -571,6 +662,24 @@ export const withAnyOtherErrors = (handler: (error: ThermalError)=>void): Reques
 );
 
 /**
+ * Provides a handler to be executed for any and all requests regardless of if they succeed or fail.
+ * This handler will run after the success/error handler(s) run.
+ * @param handler The handler to use for any requests.
+ */
+export const withFinal = (handler: ()=>void): RequestConfigurator => (
+    (config: Config<any>) => config.onFinal(handler)
+);
+
+/**
+ * Provides a query parameter on the end of the URL request.
+ * @param key The name of the query parameter.
+ * @param value The value of the query parameter.
+ */
+export const withQuery = (key: string, value: string | number | boolean): RequestConfigurator => (
+    (config: Config<any>) => config.query(key, value)
+);
+
+/**
  * Provides a dummy response that will be returned to the {@link withSuccess} handler immediately.<br/>
  * It is then up to you to properly handle the actual response of the request when it resolves.<br/><br/>
  * If the request resolves successfully, the {@link withSuccess} handler will execute a second time but with the actual response.
@@ -587,9 +696,10 @@ export const withEager = <T>(eagerResponse: T): RequestConfigurator => (
  * The cache specifically only stores in-memory. If you'd like to leverage more persistent storage you'll need to so that yourself.
  * @param amount Amount of units that the cached result will be stored for.
  * @param unit The time unit to use.
+ * @param onExpire The callback to run once a cached item expires and is removed from the cache.
  */
-export const withCache = (amount: number, unit: TimeUnit): RequestConfigurator => (
-    (config: Config<any>) => config.cacheResponse(amount, unit)
+export const withCache = <T>(amount: number, unit: TimeUnit, onExpire?: OnExpired): RequestConfigurator => (
+    (config: Config<any>) => config.cacheResponse(amount, unit, onExpire)
 );
 
 const configuratorFetchAdapter = (
@@ -602,7 +712,7 @@ const configuratorFetchAdapter = (
     );
     thermalFetch(config)
 };
-const GET = <Result>(
+const GET = (
     url: string | URL,
     ...configurators: RequestConfigurator[]
 ) => configuratorFetchAdapter(
@@ -671,10 +781,13 @@ export const Thermal = {
         getBaseURL: () => BaseUrl,
         setBaseURL: (base: string) => BaseUrl = base,
         setDefaultSuccessHandler: <T>(handler: ((data: T)=>void) | null) => DefaultSuccessHandler = handler,
-        setDefaultAnyErrorHandler: (handler: ((error: ThermalError)=>void) | null) => DefaultAnyErrorHandler = handler,
-        setDefaultAnyOtherErrorsHandler: (handler: (error: ThermalError)=>void) => DefaultAnyOtherErrorHandler = handler,
-        setDefaultErrorHandler: (type: ErrorType, handler: (error: ThermalError)=>void) => DefaultErrorHandlers.set(type, handler),
+        setDefaultAnyErrorHandler: (handler: ErrorHandler | null) => DefaultAnyErrorHandler = handler,
+        setDefaultAnyOtherErrorsHandler: (handler: ErrorHandler) => DefaultAnyOtherErrorHandler = handler,
+        setDefaultErrorHandler: (type: ErrorType, handler: ErrorHandler) => DefaultErrorHandlers.set(type, handler),
         deleteDefaultErrorHandler: (type: ErrorType) => DefaultErrorHandlers.delete(type),
         clearDefaultErrorHandlers: () => DefaultErrorHandlers.clear(),
+        clearCache: ()=>Cache.clear(),
+        disableCache: ()=>DisableCache = true,
+        enableCache: ()=>DisableCache = false,
     }
 }
